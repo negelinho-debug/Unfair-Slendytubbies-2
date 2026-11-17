@@ -1,0 +1,311 @@
+name: Unfair ST2 iOS
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Read original game files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download source --repo "$GITHUB_REPOSITORY" \
+            --pattern 'Unfair SlendyTubbies II.zip' --output original.zip
+          python3 - <<'PY'
+          from hashlib import sha256
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          with ZipFile("original.zip") as archive:
+              packs = [name for name in archive.namelist()
+                       if name.endswith("/Contents/Resources/Unfair Slendytubbies 2.pck")]
+              if len(packs) != 1:
+                  raise SystemExit("Use the 52 MB macOS ZIP from GeorgeUK.")
+              pack = archive.read(packs[0])
+          if sha256(pack).hexdigest() != "def21e15ec5bd7cddfc7bbb37255093aebd1e3f7c640e8b91e3ae9a2399f6159":
+              raise SystemExit("This is a different version of the game pack.")
+          Path("unfair.pck").write_bytes(pack)
+          PY
+
+      - name: Recover the Godot project
+        run: |
+          url=https://github.com/GDRETools/gdsdecomp/releases/download/v2.7.4
+          curl -fsSL --retry 3 "$url/GDRE_tools-v2.7.4-linux.zip" -o gdre.zip
+          sha=3dc4f1244dda62e41e0c952ac00a69e60e07f3b0d5a211164806bf9d41a54758
+          echo "$sha  gdre.zip" | sha256sum -c -
+          unzip -q gdre.zip -d gdre
+          chmod +x gdre/gdre_tools.x86_64
+          gdre/gdre_tools.x86_64 --headless --recover="$PWD/unfair.pck" --output="$PWD/game"
+          test -f game/project.godot
+          test -f game/menu.gd
+
+      - name: Adapt textures, touch input and languages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb xauth libgl1-mesa-dri fonts-dejavu-core imagemagick
+          cd game
+          cp /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf PortFont.ttf
+          for size in 76 120 1024; do
+            convert icon.png -background black -alpha remove -alpha off \
+              -resize "${size}x${size}!" "port-icon-$size.png"
+          done
+
+          cat > PortUI.gd <<'GD'
+          extends Node
+
+          var locale = 0
+
+          func _ready():
+              var saved = ConfigFile.new()
+              if saved.load("user://port-language.cfg") == OK:
+                  locale = int(clamp(saved.get_value("menu", "language", 0), 0, 2))
+
+          func text(en, ru, uk):
+              return [en, ru, uk][locale]
+
+          func font(sz):
+              var result = DynamicFont.new()
+              result.font_data = preload("res://PortFont.ttf")
+              result.size = sz
+              return result
+
+          func menu(root):
+              var layer = CanvasLayer.new()
+              root.add_child(layer)
+              var choice = OptionButton.new()
+              choice.rect_position = Vector2(760, 24)
+              choice.rect_min_size = Vector2(188, 48)
+              choice.add_font_override("font", font(20))
+              choice.get_popup().add_font_override("font", font(20))
+              for caption in ["English", "Русский", "Українська"]:
+                  choice.add_item(caption)
+              choice.select(locale)
+              choice.connect("item_selected", self, "set_language", [root])
+              layer.add_child(choice)
+              translate_menu(root)
+
+          func set_language(value, root):
+              locale = value
+              var saved = ConfigFile.new()
+              saved.set_value("menu", "language", locale)
+              saved.save("user://port-language.cfg")
+              translate_menu(root)
+
+          func translate_menu(root):
+              var lair = root.get_node("Button/Label2")
+              var classic = root.get_node("Button2/Label")
+              lair.add_font_override("font", font(15))
+              classic.add_font_override("font", font(57))
+              lair.text = text("Secret Lair", "Тайное логово", "Таємне лігво")
+              classic.text = text("SlendyTubbies Classic", "Классика", "Класика")
+              lair.mouse_filter = Control.MOUSE_FILTER_IGNORE
+              classic.mouse_filter = Control.MOUSE_FILTER_IGNORE
+
+          func touch(player, actions):
+              if OS.get_name() != "iOS":
+                  return
+              var layer = CanvasLayer.new()
+              player.add_child(layer)
+              var positions = [Vector2(128, 437), Vector2(58, 507), Vector2(128, 507),
+                               Vector2(198, 507), Vector2(845, 507)]
+              var captions = ["↑", "←", "↓", "→", text("Jump", "Прыжок", "Стрибок")]
+              for i in range(actions.size()):
+                  var button = TouchScreenButton.new()
+                  var area = RectangleShape2D.new()
+                  var width = 128 if i == 4 else 64
+                  area.extents = Vector2(width / 2.0, 32)
+                  button.shape = area
+                  button.position = positions[i] + area.extents
+                  button.action = actions[i]
+                  layer.add_child(button)
+
+                  var badge = Label.new()
+                  badge.rect_position = positions[i]
+                  badge.rect_size = Vector2(width, 64)
+                  badge.align = Label.ALIGN_CENTER
+                  badge.valign = Label.VALIGN_CENTER
+                  badge.mouse_filter = Control.MOUSE_FILTER_IGNORE
+                  badge.add_font_override("font", font(20))
+                  var bg = StyleBoxFlat.new()
+                  bg.bg_color = Color(0, 0, 0, 0.55)
+                  badge.add_stylebox_override("normal", bg)
+                  badge.text = captions[i]
+                  layer.add_child(badge)
+              layer.connect("tree_exiting", self, "release_actions", [actions])
+
+          func release_actions(actions):
+              for action in actions:
+                  Input.action_release(action)
+          GD
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import shutil
+
+          def edit(filename, old, new):
+              file = Path(filename)
+              source = file.read_text(encoding="utf-8")
+              if source.count(old) != 1:
+                  raise SystemExit(f"Unexpected source in {filename}")
+              file.write_text(source.replace(old, new), encoding="utf-8")
+
+          project = Path("project.godot")
+          source = project.read_text(encoding="utf-8")
+          geometry = '''[autoload]
+          PortUI="*res://PortUI.gd"
+
+          [display]
+          window/size/width=1024
+          window/size/height=600
+          window/stretch/mode="2d"
+          window/stretch/aspect="keep"
+          window/handheld/orientation=0
+
+          [input_devices]
+          pointing/emulate_mouse_from_touch=true
+
+          '''
+          source = source.replace("[input]\n", geometry + "[input]\n", 1)
+          source = source.replace("[rendering]\n", "[rendering]\nvram_compression/import_etc2=true\n", 1)
+          project.write_text(source, encoding="utf-8")
+          for path in Path(".").rglob("*.import"):
+              if path.is_file():
+                  original = path.read_text(encoding="utf-8")
+                  updated = re.sub(r"^compress/mode=2$", "compress/mode=0", original, flags=re.M)
+                  if updated != original:
+                      path.write_text(updated, encoding="utf-8")
+          shutil.rmtree(".import", ignore_errors=True)
+
+          edit("menu.gd", "func _ready():", "func _ready():\n\tPortUI.menu(self)")
+          edit("gameoveryeah.gd", "func _ready():",
+               'func _ready():\n\t$Label.add_font_override("font", PortUI.font(30))\n'
+               '\t$Label.text = PortUI.text("Game Over Yeah!", "Игра окончена!", "Гру завершено!")')
+          first = "src/player/Player.gd"
+          classic = "reused shi/Player.gd"
+          edit(first, "func _ready():",
+               'func _ready():\n\tPortUI.touch(self, ["move_forward", "move_left", "move_back", "move_right", "jump"])')
+          edit(classic, "func _ready():",
+               'func _ready():\n\tPortUI.touch(self, ["forward", "left", "backward", "right", "jump"])')
+          edit(first, "func _unhandled_input(event):",
+               'func _unhandled_input(event):\n'
+               '\tif OS.get_name() == "iOS":\n'
+               '\t\tif event is InputEventScreenDrag and event.position.x > 290:\n'
+               '\t\t\trotate_y(deg2rad(-event.relative.x * 0.28))\n'
+               '\t\t\tspring_arm.rotate_x(deg2rad(-event.relative.y * 0.28))\n'
+               '\t\treturn')
+          edit(classic, "func _input(event):",
+               'func _input(event):\n'
+               '\tif OS.get_name() == "iOS":\n'
+               '\t\tif event is InputEventScreenDrag and event.position.x > 290:\n'
+               '\t\t\tlook_rot.y -= event.relative.x * 0.28\n'
+               '\t\t\tlook_rot.x = clamp(look_rot.x - event.relative.y * 0.28, min_angle, max_angle)\n'
+               '\t\treturn')
+          for file in (first, classic):
+              path = Path(file)
+              lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+              idx = next(i for i, line in enumerate(lines) if line == "\tInput.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)\n")
+              lines[idx] = '\tif OS.get_name() != "iOS":\n\t' + lines[idx]
+              path.write_text("".join(lines), encoding="utf-8")
+          PY
+
+      - name: Export Xcode project with Godot 3.4.4
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: |
+          set -euo pipefail
+          base=https://github.com/godotengine/godot-builds/releases/download/3.4.4-stable
+          curl -fsSL --retry 3 "$base/Godot_v3.4.4-stable_x11.64.zip" -o godot.zip
+          curl -fsSL --retry 3 "$base/Godot_v3.4.4-stable_export_templates.tpz" -o templates.tpz
+          unzip -q godot.zip
+          godot="$PWD/Godot_v3.4.4-stable_x11.64"
+          chmod +x "$godot"
+          template="$PWD/iphone.zip"
+          unzip -p templates.tpz templates/iphone.zip > "$template"
+          test -s "$template"
+          mkdir -p xcode logs
+          cp game/gdre_export.log logs/recovery.log
+          cp /usr/share/doc/fonts-dejavu-core/copyright xcode/DejaVu-LICENSE.txt
+          cat > game/export_presets.cfg <<EOF
+          [preset.0]
+          name="iOS"
+          platform="iOS"
+          runnable=true
+          custom_features=""
+          export_filter="all_resources"
+          include_filter=""
+          exclude_filter=""
+          script_export_mode=1
+
+          [preset.0.options]
+          custom_template/release="$template"
+          custom_template/debug="$template"
+          architectures/arm64=true
+          application/app_store_team_id="0000000000"
+          application/identifier="com.unfairst2.fanport"
+          application/name="Unfair SlendyTubbies 2"
+          icons/generate_missing=true
+          required_icons/iphone_120x120="res://port-icon-120.png"
+          required_icons/ipad_76x76="res://port-icon-76.png"
+          required_icons/app_store_1024x1024="res://port-icon-1024.png"
+          storyboard/use_launch_screen_storyboard=true
+          launch_screens/generate_missing=true
+          EOF
+          xvfb-run -a "$godot" --path "$PWD/game" --editor --quit 2>&1 | tee logs/import.log
+          xvfb-run -a "$godot" --path "$PWD/game" --export iOS "$PWD/xcode/UnfairST2.ipa" 2>&1 | tee logs/export.log
+          test -s xcode/UnfairST2.xcodeproj/project.pbxproj
+          test -s xcode/UnfairST2.pck
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UnfairST2-Xcode
+          path: xcode/
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: UnfairST2-Godot-Logs
+          path: logs/
+
+  ipa:
+    needs: export
+    runs-on: macos-15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: UnfairST2-Xcode
+          path: xcode
+
+      - name: Build unsigned arm64 IPA
+        run: |
+          set -euo pipefail
+          xcodebuild -project xcode/UnfairST2.xcodeproj -target UnfairST2 \
+            -configuration Release -sdk iphoneos CONFIGURATION_BUILD_DIR="$PWD/build" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO ARCHS=arm64 \
+            IPHONEOS_DEPLOYMENT_TARGET=15.0 | tee xcodebuild.log
+          app="$(find build -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "$app"
+          test -s "$app/UnfairST2.pck"
+          binary="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")"
+          xcrun lipo -verify_arch arm64 "$app/$binary"
+          mkdir -p Payload
+          ditto "$app" Payload/UnfairST2.app
+          cp xcode/DejaVu-LICENSE.txt Payload/UnfairST2.app/
+          ditto -c -k --keepParent Payload UnfairST2-iOS.ipa
+          unzip -tq UnfairST2-iOS.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UnfairST2-iOS
+          path: UnfairST2-iOS.ipa
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: UnfairST2-Xcode-Log
+          path: xcodebuild.log
